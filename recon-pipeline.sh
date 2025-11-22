@@ -55,109 +55,119 @@ cat > pipeline.sh <<'BASH'
 #!/usr/bin/env bash
 # pipeline.sh
 # Usage: ./pipeline.sh programs.txt
-# programs.txt should contain one program domain/asset per line (e.g. example.com)
 set -euo pipefail
+
 if [ "$#" -lt 1 ]; then
   echo "Usage: $0 programs.txt"
   exit 1
 fi
+
 PROGRAMS="$1"
 WORKDIR="$(pwd)"
 OUTDIR="$WORKDIR/out"
 mkdir -p "$OUTDIR"
 
-# Step A: Expand programs -> subdomains
+##############################################################
+# STEP 1 — Subdomain Enumeration
+##############################################################
 echo "[1/6] Running subfinder..."
 subfinder -dL "$PROGRAMS" -all -silent -o "$OUTDIR/subs.txt"
 
-# Step B: Probe alive + detect tech (httpx)
-echo "[2/6] Running httpx to find alive hosts and detect tech..."
-httpx -l "$OUTDIR/subs.txt" -silent -title -status-code -tech-detect -o "$OUTDIR/httpx_full.txt"
-# Extract hosts only
-awk '{print $1}' "$OUTDIR/httpx_full.txt" | sed 's/https\?:\/\///' | sort -u > "$OUTDIR/hosts.txt"
+##############################################################
+# STEP 2 — httpx: Alive Hosts Only
+##############################################################
+echo "[2/6] Running httpx on discovered subdomains..."
+httpx -l "$OUTDIR/subs.txt" \
+     -silent \
+     -mc 200,301,302,307,308 \
+     -o "$OUTDIR/live.txt"
 
-# Step C: Filter WordPress hosts (simple heuristics: /wp-admin, x-powered-by:WordPress or html generator)
-echo "[3/6] Filtering WordPress hosts..."
-cat "$OUTDIR/hosts.txt" | httpx -silent -path "/wp-admin/" -status-code -o "$OUTDIR/wp_candidates.txt"
-# Also check generator meta tag
-python3 - <<'PY'
-import sys,requests
-hosts=open('out/hosts.txt').read().splitlines()
-wp=[]
-for h in hosts:
-    url = f'https://{h}'
-    try:
-        r = requests.get(url, timeout=8)
-        txt = r.text.lower()
-        if 'wordpress' in txt or '/wp-content/' in txt:
-            wp.append(h)
-    except Exception:
-        try:
-            r = requests.get('http://'+h, timeout=8)
-            txt = r.text.lower()
-            if 'wordpress' in txt or '/wp-content/' in txt:
-                wp.append(h)
-        except Exception:
-            pass
-open('out/wp_detected.txt','w').write('\n'.join(sorted(set(wp))))
-print('Found',len(set(wp)),'wordpress candidates')
-PY
+echo "[*] Alive hosts: $(wc -l < $OUTDIR/live.txt)"
 
-# Step D: Nuclei scan for plugin/version using template (provided in templates/)
-echo "[4/6] Running nuclei to detect plugin/version..."
-if [ ! -f templates/plugin-version.yaml ]; then
-  echo "Missing templates/plugin-version.yaml — please add your nuclei template to templates/"
-else
-  nuclei -t templates/plugin-version.yaml -l out/wp_detected.txt -o "$OUTDIR/vuln_plugin.txt" || true
+##############################################################
+# STEP 3 — WordPress Detection using Nuclei
+##############################################################
+echo "[3/6] Running nuclei WordPress detection..."
+
+if [ ! -f templates/wordpress-detect.yaml ]; then
+  echo "ERROR: Missing templates/wordpress-detect.yaml — create it first."
+  exit 1
 fi
 
-# Step E: Crawl discovered vulnerable hosts with katana
-echo "[5/6] Crawling vulnerable hosts with katana to collect pages..."
+nuclei -t templates/wordpress-detect.yaml \
+       -l "$OUTDIR/live.txt" \
+       -silent \
+       -o "$OUTDIR/wp_detected_raw.txt" || true
+
+# Extract unique URLs only
+cut -d ' ' -f1 "$OUTDIR/wp_detected_raw.txt" | sort -u > "$OUTDIR/wp_hosts.txt"
+
+echo "[*] WordPress hosts identified: $(wc -l < $OUTDIR/wp_hosts.txt)"
+
+##############################################################
+# STEP 4 — Plugin / Version Detection via Custom Template
+##############################################################
+echo "[4/6] Running nuclei plugin detection..."
+
+if [ ! -f templates/plugin-version.yaml ]; then
+  echo "Missing templates/plugin-version.yaml — add your plugin template."
+else
+  nuclei -t templates/plugin-version.yaml \
+         -l "$OUTDIR/wp_hosts.txt" \
+         -silent \
+         -o "$OUTDIR/vuln_plugin.txt" || true
+fi
+
+##############################################################
+# STEP 5 — Crawl Vulnerable Hosts with Katana
+##############################################################
+echo "[5/6] Crawling vulnerable hosts..."
+
 mkdir -p "$OUTDIR/katana_pages"
+
 if [ -s "$OUTDIR/vuln_plugin.txt" ]; then
-  cut -d' ' -f1 "$OUTDIR/vuln_plugin.txt" | sort -u > "$OUTDIR/vuln_hosts.txt"
+  cut -d ' ' -f1 "$OUTDIR/vuln_plugin.txt" | sort -u > "$OUTDIR/vuln_hosts.txt"
+
   while read -r host; do
-    echo "Crawling https://$host"
-    katana -u "https://$host" -depth 3 -o "$OUTDIR/katana_pages/${host}.txt" || true
+    echo "Crawling $host"
+    katana -u "$host" -depth 3 -silent -o "$OUTDIR/katana_pages/$(echo "$host" | sed 's#https://##;s#http://##').txt" || true
   done < "$OUTDIR/vuln_hosts.txt"
 else
-  echo "No vuln hosts found by nuclei. Exiting crawl step."
+  echo "No vulnerable hosts found — skipping katana."
 fi
 
-# Step F: Extract form endpoints and save to forms.txt
-echo "[6/6] Extracting forms from crawled pages..."
+##############################################################
+# STEP 6 — Extract Form Endpoints
+##############################################################
+echo "[6/6] Extracting forms..."
+
 python3 - <<'PY'
 from bs4 import BeautifulSoup
 import glob
+
 forms=set()
+
 for f in glob.glob('out/katana_pages/*.txt'):
     try:
         txt=open(f,'r',errors='ignore').read()
     except:
         continue
-    soup=BeautifulSoup(txt,'html.parser')
+
+    soup = BeautifulSoup(txt, 'html.parser')
+
     for form in soup.find_all('form'):
-        action=form.get('action', '').strip()
+        action = form.get('action', '').strip()
         if action.startswith('http'):
             forms.add(action)
         elif action.startswith('/'):
             host = f.split('/')[-1].replace('.txt','')
-            forms.add('https://'+host+action)
-    # also basic heuristics: look for contact pages
-    for line in txt.splitlines():
-        if 'contact' in line.lower() and 'http' in line.lower():
-            parts=line.split()
-            for p in parts:
-                if p.startswith('http') and 'mailto' not in p:
-                    forms.add(p)
-open('out/forms.txt','w').write('\n'.join(sorted(forms)))
-print('Forms extracted:',len(forms))
+            forms.add('https://' + host + action)
+
+open('out/forms.txt','w').write("\n".join(sorted(forms)))
+print("Forms extracted:", len(forms))
 PY
 
-echo "Pipeline finished. Outputs in $OUTDIR"
-ls -lah "$OUTDIR"
-
-echo "Next step: configure your XSS catcher (e.g., ezXSS) and set YOUR_XSS_DOMAIN in send_payloads.py."
+echo "Pipeline complete. Output saved in: $OUTDIR"
 BASH
 
 cat > send_payloads.py <<'PY'
